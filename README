@@ -1,0 +1,323 @@
+Medallia ECI Challenge 2013
+---------------------------
+
+ A bit of background
+ -------------------
+
+ This year's challenge is inspired by a problem we tried to solve with our 
+internal OLAP engine. Slug (which is the name of the engine) is an in-memory, 
+extremely fast OLAP engine, that allows our customers to slice-and-dice their 
+data in any way they want, answering queries under a second.
+ 
+ An OLAP engine works over discrete data cubes (hypercubes usually). Where each 
+dimension of the cube is a variable, with its own data domain (i.e. range of 
+legal values).
+ 
+ For example, you could have a cube with three dimensions:
+ 	- age (0 to 120)
+ 	- gender (male or female)
+ 	- overall satisfaction (1 to 5)
+ 
+ Each coordinate within the cube represents a data point. Usually an OLAP cube 
+is mostly empty.
+ 
+ Typical OLAP queries are:
+ 	- get the score distribution grouped by gender
+ 	- get the average score overall
+ 	- get the average score grouped by 10 year age buckets
+ 	
+ These are modelled as a series of slices (e.g. slice the cube across the age 
+dimension, use 10 year slices) and agregation operations (e.g. compute the 
+average of each slice).
+ 
+ Since cubes are mostly empty, only coordinates that hold values are stored, 
+for example:
+ 
+ 	age | gender | score
+  -----+--------+-------
+    23 |  male  |   4
+    41 |  male  |   5
+    34 | female |   3
+    52 |  ----  |   5  
+ 
+ Note that some data points may not contain a value across a dimension. In 
+general, from the engine point of view, all variables are nullable. Some may 
+have a default value if not present.
+ 
+ In practice, a cube as above would have an additional dimension that will 
+serve as a record id and makes each point unique, but we can ignore that for 
+now.
+ 
+ In Slug teminology, each of the cube's dimensions is a field, which has a name 
+and metadata about valid values that it can hold.
+ 
+ Internally, Slug stores it's data in several segments, each segment having 
+several storage columns, and each column holding values for one or more fields:
+ 
+ Segment 0: 
+ 	+----------------+----------------+----------------+----------------+
+ 	|      col 0     |      col 1     |      col 2     |      col 3     |
+ 	+----------------+----------------+----------------+----------------+
+ 	| f1 |     f2    |       f5       |    f3  |   f4  | f6 |   f7   |f8|
+ 	|....|...........|................|........|.......|....|........|..|
+	
+	...
+
+  Segment N: 
+ 	+----------------+----------------+----------------+----------------+
+ 	|      col 0     |      col 1     |      col 2     |      col 3     |
+ 	+----------------+----------------+----------------+----------------+
+ 	| f1 |     f2    |       f5       |    f3  |   f4  | f6 |   f7   |f8|
+ 	|....|...........|................|........|.......|....|........|..|
+ 	
+ The field to column layout is the same for all segments. Each column is an 
+integer array, and fields are packed in as little space as needed. Packing 
+colun-wise helps with adding/removing fields, and with cache locality when 
+executing queries that do not touch many fields.
+ 
+ Segments sizes are typically bounded between 1-64K rows per segment, rounded 
+to the next power of two.
+ 
+ For example, the space requirements for the fields of the cube defined above:
+  	- age (0 to 120): needs 7 bits
+ 	- gender (male or female): needs 2 bits (assuming is nullable, so 3 
+possible values)
+ 	- overall satisfaction (1 to 5): needs 3 bits
+ 	
+ Typical Slug cubes are much larger, some with 1000s of fields/dimensions, and 
+millions of rows.
+ 
+ One thing that we observe in customer datasets is that fields are added over 
+time and some fields become unused, but since the data is kept for querying, 
+datasets are typically sparsely populated. 
+ 
+ Medallia is in the business of customer experience management, so many of the 
+records are the results of surveys. Each survey question is modelled as a 
+field, and a customer may have many different survey programs running at any 
+given time, each of which fills only a few fields of all the available ones.
+ 
+ So a dataset segment will look something like the following:
+
+ +col0|col1|col2|col3|col4|col5+
+ +----+----+----+----+----+----+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +____|____|___X|XXXX|__XX|X___+
+ +____|____|___X|XXXX|__XX|X___+
+ +____|____|___X|XXXX|__XX|X___+
+ +____|____|___X|XXXX|__XX|X___+
+ 
+  With Xs representing used bits and dashes representing zeroes, what you'd see 
+is large chunks of data with large chunks of zeroes.
+ 
+  By carefully re-arranging the fields into columns:
+
+ +col0|col1|col2|col3|col4|col5+
+ +----+----+----+----+----+----+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+  
+ You can represent the same data, but columns 4 and 5 end up being nothing but 
+zeroes, so as long as these records are not modified, they could share the 
+underlying storage, that is, sharing the same null vector.
+ 
+ This null vector could be shared across all segments in the dataset, producing 
+significant savings.
+ 
+ We implemented this on Slug, getting 3% to 40% memory savings on customer 
+datasets just by reordering columns (the average is around 20%). For example in 
+one large dataset it means we save close to 30GB of RAM.
+ 
+ The other thing we could do to make the savings better is reordering rows, so 
+as to group similar rows in the same segments, increasing the chance that a 
+column of nulls will arise.
+ 
+ For example, splitting the segment above into two:
+ 
+ +col0|col1|col2|col3|col4|col5+
+ +----+----+----+----+----+----+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ +XXXX|XXXX|____|____|____|____+
+ 
+ +col0|col1|col2|col3|col4|col5+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ +____|____|XXXX|XXXX|____|____+
+ 
+ There are now many more null vectors, at the cost of potentially lost savings 
+in having more segments (segments use some memory, even if empty).
+ 
+ The Challenge
+ -------------
+ 
+ This year's challenge is (perhaps unsurprisingly) also known as the 
+Null-vector challenge.
+ 
+ Your mission, should you decide to accept it, is to implement two algorithms:
+ 	- column reordering: re-arrange fields into columns so as to maximize 
+chances of null columns.
+ 	- row reordering: re-arrange rows into segments, trying to maximize 
+null columns
+ 	
+ This will run in a simulator, on anonymized production data detailing used 
+field layouts, field to column mappings and record to segments.
+ 
+ The amount of data will be quite large and the runs will be time-constrained.
+ Currently, runs over 50 minutes are aborted. The JVM runs with 3GB of ram, 
+your submission should have at least 1GB of RAM available to it (the data files 
+are fully loaded in memory and have different sizes, so memory pressure will 
+vary during the run).
+ 
+ Setup
+ -----
+ 
+ First of all, you'll need the SDK (if you're reading this from the SDK's 
+README file, I assume you already have it ;).
+ 
+ Go to http://challenge.medallia.com and download it and extract it.
+ 
+ You'll need to have a recent version of Apache Maven and a recent Java SDK 
+too. If you don't have them ready, go ahead an install both.
+ 
+ Building and running
+ --------------------
+ 
+ You can build the sample simulator by doing:
+ 
+ 	~/eci-challenge$ mvn clean package
+ 
+ 
+ It can be run by calling:
+ 
+ 	~/eci-challenge$ ./run.sh
+ 
+ If the script fails, check that java is in your search path.
+ 
+ Getting Started
+ ---------------
+
+ You should have the following files in your challenge SDK: 
+ 
+ .
+├── README
+├── pom.xml   <-- sdk root pom.xml
+├── run.sh    <-- utility script to execute your submission with sample data
+├── runner    <-- runner module, contains the source code for the simulator
+└── simulator <-- your code goes in this module
+    ├── pom.xml
+    └── src
+        └── main
+            └── java
+                └── medallia
+                    └── sim
+                        └── Submission.java <-- submission entry point
+
+ Take a peek at Submission.java, it contains a very simple (and not very good) 
+implementation of a column and row packing simulator.
+ 
+ The submission itself implements SimulatorFactory interface, used to create 
+both a RecordLayoutSimulator and a FieldLayoutSimulator.
+ 
+ There are basic implementations of both, and several utility classes and 
+methods available to help with them.
+ 
+ Simulators
+ ----------
+  
+ There are two fundamental pieces of information available to each of the 
+simulators:
+ 
+ 	- BitSet[] layouts: an array of unique field layouts. 
+ 	- List<Field> fields: a list of fields
+ 
+ The simulators will receive records as indices into the layouts array. 
+ The layouts have a bit set for each field, and fields in the 'fields' array 
+are in the same order than bits in the layout.
+ 
+ For example, if you have a dataset with 5 fields:
+ { a, b , c, d, e }
+ 
+ And the following field usage data:
+ 
+ 01001
+ 11010
+ 10101
+ 01001
+ 11010
+ 10101
+
+ There are three unique layouts:
+ 
+ 0: 01001
+ 1: 11010
+ 2: 10101
+ 
+ So the records will be passed to the simulator in the following order:
+ 
+ {0, 1, 2, 0, 1, 2}
+ 
+ Where each layout is passed as an argument in subsequent calls to the 
+processRecord() method.
+ 
+ You also have an 'index' attribute in each field that gives its original 
+position. This will be useful when re-arranging fields into columns.
+ 
+ So if you want to know if field.get(42) is set in layout 5, you can do:
+ 
+ 	layouts[5].get(field.get(42).index) 
+ 
+ Be careful not to modify the layouts, it will be checked in the analysis phase 
+and might cause hard to track problems.
+ 
+ You can run Submission's main method from an IDE such as InteliJ IDEA or 
+Eclipse to test your submission.
+ 
+ The output of a single run is similar to the following:
+ 
+company12:dataset1:Simple 72894 rows (7951 layouts), 545 fields (197 columns in 
+2 segments): 14.2% used-data, 89.3% used-columns, 51M
+company12:dataset2:Simple 142345 rows (510 layouts), 107 fields (42 columns in 
+3 segments): 30.1% used-data, 92.9% used-columns, 22M
+company11:dataset1:Simple 3150 rows (14 layouts), 93 fields (37 columns in 1 
+segments): 38.8% used-data, 78.4% used-columns, 371K
+...
+** Simple - total bytes used: 6.5G
+
+ It will output, for each company's dataset:
+ 	- # of records (rows) in the dataset
+ 	- # of unique field layouts
+ 	- # of fields
+ 	- how many columns are used by your layout and how many segments
+ 	- % of bits that are used by non-zero fields
+ 	- % of columns that contain at least one non-zero value
+ 	- used memory taking the null vector savings in consideration
+ 
+ In the end it will print the total memory usage of a dataset if the data was 
+laid out as specified by your algorithm.
+ 
+ 
+ Submitting your code
+ --------------------
+ 
+ Go to the SDK directory, and rebuild your submission:
+ 
+  	~/eci-challenge$ mvn clean package
+
+ The generated code will be named 'simulator-1.0.jar' under simulator/target:
+
+  	~/eci-challenge$ls simulator/target/
+	classes           generated-sources maven-archiver    simulator-1.0.jar 
+	surefire
+ 
+ Submit that jar in http://challenge.medallia.com
